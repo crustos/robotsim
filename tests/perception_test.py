@@ -92,6 +92,64 @@ def test_blank_page_is_the_baseline():
     print('baseline OK')
 
 
+def test_tolerant_scoring_is_not_a_free_pass():
+    """
+    A matching tolerance must reward localisation error, not reward everything.
+
+    Strokes here are one pixel wide, so a prediction that traces a contour
+    perfectly but one pixel off scores zero strictly -- the strict metric
+    measures localisation as much as detection. Allowing a tolerance separates
+    them, which is how boundary detection is normally scored. The risk is that a
+    tolerant metric quietly rewards a model that simply predicts a lot, so both
+    failure modes are pinned here.
+    """
+    from perception import dilate
+    ## dilation must not wrap around the image edge
+    m = np.zeros((1, 1, 5, 5), dtype=bool)
+    m[0, 0, 0, 0] = True
+    d = dilate(m, 1)
+    assert d.sum() == 4, d.sum()
+    assert not d[0, 0, 4, 4] and not d[0, 0, 0, 4], 'dilation wrapped around the edge'
+
+    target = np.zeros((1, 1, 16, 16), dtype=np.float32)
+    target[0, 0, 8, 2:14] = 1.0                     # a horizontal stroke
+
+    ## a perfect trace, one pixel low: strictly worthless, tolerantly perfect
+    shifted = np.zeros_like(target)
+    shifted[0, 0, 9, 2:14] = 1.0
+    assert close(scores(shifted, target)['f1'], 0.0), scores(shifted, target)
+    assert close(scores(shifted, target, tolerance=1)['f1'], 1.0), \
+        scores(shifted, target, tolerance=1)
+
+    ## predicting ink everywhere must not score well even with tolerance: it has
+    ## demonstrated no localisation at all
+    everything = np.ones_like(target)
+    lenient = scores(everything, target, tolerance=1)
+    print('all-ink prediction at tolerance 1: P %.3f R %.3f F1 %.3f'
+          % (lenient['precision'], lenient['recall'], lenient['f1']))
+    assert lenient['recall'] > 0.9, 'it does cover every stroke'
+    assert lenient['precision'] < 0.25, 'but almost none of it is near one'
+    assert lenient['f1'] < 0.45, lenient
+
+    ## and the blank page stays worthless however tolerant the scoring
+    blank = np.zeros_like(target)
+    for tol in (0, 1, 2):
+        assert scores(blank, target, tolerance=tol)['f1'] == 0.0
+    print('tolerant scoring OK')
+
+
+def test_dilated_receptive_field():
+    """Dilation widens the field without changing the output shape."""
+    net = LineArtNet(width=4, depth=4, seed=0, dilations=[1, 2, 4])
+    x = np.random.default_rng(0).random((2, 3, 12, 10)).astype(np.float32)
+    assert net.forward(x).shape == (2, 1, 12, 10), net.forward(x).shape
+    assert net.dilations == [1, 2, 4], net.dilations
+    ## a dilated layer must pad more, or it crops and every later layer shifts
+    conv = [l for l in net.layers if hasattr(l, 'dilation')]
+    assert [c.pad for c in conv[:3]] == [1, 2, 4], [c.pad for c in conv[:3]]
+    print('dilation OK')
+
+
 def test_loss_is_stable():
     """BCE from logits must not overflow where a confident prediction lives."""
     logits = np.array([[[[-800.0, 800.0], [0.0, -40.0]]]], dtype=np.float64)
@@ -210,6 +268,8 @@ def test_save_load_round_trip():
 test_gradients()
 test_im2col_adjoint()
 test_blank_page_is_the_baseline()
+test_tolerant_scoring_is_not_a_free_pass()
+test_dilated_receptive_field()
 test_loss_is_stable()
 test_corpus_and_split()
 test_it_actually_learns()

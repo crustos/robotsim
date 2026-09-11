@@ -207,6 +207,123 @@ def test_verify_catches_misalignment_and_darkness():
     print('verification OK')
 
 
+def test_shard_manifests_merge():
+    """Shards write separate manifests; merging orders them by index."""
+    from dataset import merge_manifests, read_manifest
+    root = OUT + '-shards'
+    os.system('rm -rf %s' % root)
+    from PIL import Image
+    made = []
+    for shard in range(3):
+        ds = Dataset(root, passes=('rgb',), overwrite=False,
+                     manifest='manifest.%03d.jsonl' % shard)
+        for i in range(shard, 9, 3):          # disjoint indices, as the launcher splits them
+            path = '/tmp/sh-%d.png' % i
+            Image.new('RGB', (8, 8), (i * 20 % 256, 40, 60)).save(path)
+            ds.write(i, rgb=path)
+            made.append(i)
+        ds.close()
+
+    merged = merge_manifests(root)
+    assert merged == 9, merged
+    entries = read_manifest(os.path.join(root, 'manifest.jsonl'))
+    ## sorted by index, not by shard: the deterministic split by position must
+    ## mean the same thing however many workers produced the corpus
+    assert [e['index'] for e in entries] == list(range(9)), [e['index'] for e in entries]
+    ## shard manifests are consumed
+    import glob
+    assert not glob.glob(os.path.join(root, 'manifest.0*.jsonl'))
+    print('shard merge OK')
+
+
+def test_merge_without_shards_is_harmless():
+    """
+    Merging a corpus that was never sharded must not truncate it.
+
+    This is a real bug that shipped: with one worker the generator writes the
+    real manifest directly, the merge step found no shard files, and wrote an
+    empty one over the top -- leaving a corpus whose files all exist and whose
+    index is empty.
+    """
+    from dataset import merge_manifests, read_manifest
+    root = OUT + '-noshards'
+    os.system('rm -rf %s' % root)
+    from PIL import Image
+    ds = Dataset(root, passes=('rgb',), overwrite=True)
+    for i in range(4):
+        path = '/tmp/ns-%d.png' % i
+        Image.new('RGB', (8, 8), (10 * i, 20, 30)).save(path)
+        ds.write(i, rgb=path)
+    ds.close()
+
+    kept = merge_manifests(root)
+    assert kept == 4, kept
+    assert len(read_manifest(os.path.join(root, 'manifest.jsonl'))) == 4
+    print('merge without shards OK')
+
+
+def test_prune_drops_only_the_bad():
+    """One dead sample must not invalidate the corpus."""
+    from dataset import indices_in
+    from PIL import Image
+    root = OUT + '-prune'
+    os.system('rm -rf %s' % root)
+    ds = Dataset(root, passes=('rgb',), overwrite=True)
+    import random
+    rng = random.Random(0)
+    for i in range(5):
+        path = '/tmp/pr-%d.png' % i
+        img = Image.new('RGB', (16, 16))
+        if i == 2:
+            img.paste((128, 128, 128), (0, 0, 16, 16))      # featureless: unusable
+        else:
+            img.putdata([(rng.randrange(256), rng.randrange(256), rng.randrange(256))
+                         for _ in range(16 * 16)])
+        img.save(path)
+        ds.write(i, rgb=path)
+    ds.close()
+
+    problems = ds.verify()
+    bad = indices_in(problems)
+    print('verify flagged: %s' % sorted(bad))
+    assert bad == {2}, (bad, problems)
+
+    dropped = ds.prune(bad)
+    assert dropped == 1
+    kept = [e['index'] for e in ds.entries()]
+    assert kept == [0, 1, 3, 4], kept
+    assert ds.verify() == []
+    ## files are left on disk, so a dropped sample can still be examined
+    assert os.path.isfile(os.path.join(root, 'train', '000002.rgb.png'))
+    print('prune OK')
+
+
+def test_clear_frees_datablocks():
+    """
+    clear() must free the data, not just unlink the object.
+
+    Removing an object orphans its mesh, and over a corpus of thousands of
+    scenes those orphans accumulate into real memory -- and take the names with
+    them, so identical scenes end up with differently-named objects.
+    """
+    r = Randomizer(seed=4, extent=6.0)
+    ## Measured as a delta, not an absolute: earlier tests in this file leave
+    ## their own lamps and meshes behind, and an absolute count would report
+    ## their state rather than this one's.
+    meshes_before = len(bpy.data.meshes)
+    lights_before = len(bpy.data.lights)
+    for _ in range(3):
+        r.scene(obstacles=(4, 4))
+        r.lighting(count=(2, 2))
+        r.clear()
+    mesh_leak = len(bpy.data.meshes) - meshes_before
+    light_leak = len(bpy.data.lights) - lights_before
+    print('after 3 build/clear cycles: %+d meshes, %+d lamps' % (mesh_leak, light_leak))
+    assert mesh_leak <= 0, 'clear() leaked %d mesh datablocks' % mesh_leak
+    assert light_leak <= 0, 'clear() leaked %d lamp datablocks' % light_leak
+    print('datablock cleanup OK')
+
+
 def test_end_to_end_sample():
     """One real sample, all four modalities, aligned."""
     fresh_scene()
@@ -259,5 +376,9 @@ test_lineart_renders_and_restores()
 test_dataset_write_and_verify()
 test_dataset_refuses_incomplete()
 test_verify_catches_misalignment_and_darkness()
+test_shard_manifests_merge()
+test_merge_without_shards_is_harmless()
+test_prune_drops_only_the_bad()
+test_clear_frees_datablocks()
 test_end_to_end_sample()
 print('dataset test OK')
