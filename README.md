@@ -82,6 +82,7 @@ while RobotSim.callbacks:
 | `npr.py` | yes | Non-photorealistic line art. Flattens the scene and renders structure only. |
 | `randomize.py` | yes | Seeded domain randomisation: layout, materials, lighting, viewpoint. |
 | `dataset.py` | **no** | Corpus writer. Aligned samples, a manifest that explains them, and verification. |
+| `perception.py` | **no** | Stage 1: learns photograph to line drawing. Pure numpy, no Blender, verified against a numerical gradient check. |
 | `telemetry.py` | **no** | Records channels per tick and draws them as a matplotlib panel with the firmware console attached. Optional: only drawing needs matplotlib. |
 | `firmware.py` | **no** | Real C/C++ firmware in the loop via crust's hostsim, and the `Network` bus between boards. Optional: does nothing unless crust is cloned beside robotsim. |
 | `ros2/joint_export.py` | yes | Exports a recorded arm motion as a ROS2-style joint trajectory (JSON or text). |
@@ -758,6 +759,66 @@ produces a large, well-formed, useless corpus.
 So `--rgb-engine` defaults to EEVEE and `--rgb-engine cycles` restores the
 single-engine path on a full build. The exposure check exists because of this.
 
+## Stage 1: perception
+
+The perception half of the chained architecture. It takes the messy
+photorealistic frame and emits the structural abstraction a control policy is
+trained on, so the policy never sees a texture, a shadow or a specular highlight
+and cannot be confused by one.
+
+```sh
+./tools/generate_dataset.py -- --samples 500 --out /tmp/corpus
+./tools/train_perception.py --corpus /tmp/corpus --epochs 60
+```
+
+`perception.py` needs no `bpy`, so training runs under plain Python and can go
+somewhere with more cores than the machine that generated the corpus.
+
+### The trap this is built around
+
+Line art is about 99% white. **A network that outputs a blank page scores 0.99
+accuracy and has learned nothing.** Two things follow, and they are the substance
+of the module rather than details of it:
+
+- the loss weights ink pixels far above background, so blankness is not the
+  cheapest way down;
+- the reported metric is F1 over ink pixels, never accuracy, and every score is
+  printed beside what the blank page achieves on the same data.
+
+Measured on a 140-sample corpus at 64x48, 70 epochs:
+
+| | F1 | precision | recall | accuracy |
+| --- | --- | --- | --- | --- |
+| blank page | 0.000 | — | 0.000 | 0.988 |
+| trained | **0.341** | 0.232 | 0.645 | 0.970 |
+
+The trained model's *accuracy is worse than the blank page's* while its F1 goes
+from nothing to a third. That row is the argument for the metric choice, in one
+line.
+
+Threshold tuning was tried and did not help: chosen on training data it gave
+0.325 on validation against 0.341 at the default, so the default stands. Choosing
+it on the validation set would have "improved" the number, which is how a tuned
+threshold becomes an inflated score.
+
+### Why numpy rather than torch
+
+Torch is the right tool and the module is shaped so it can be swapped in --
+`LineArtNet` is a plain stack of layers behind `forward`/`backward`, and nothing
+above it assumes how the gradients were produced.
+
+It is not used here because the PyPI Linux wheel links CUDA libraries even for
+CPU-only use: `libtorch_global_deps.so` needs libcublas at import, `--no-deps`
+therefore cannot work, and the dependency chain measures over four gigabytes
+unpacked. Rather than ship code that cannot be run and therefore cannot be
+trusted, the reference implementation is numpy -- slower, and small enough to
+verify against a numerical gradient check.
+
+That check is in `test_perception`, and it runs in float64 deliberately: a
+numerical derivative is a difference of two nearly equal numbers, and in float32
+the cancellation swamps the result. The check then fails on arithmetic rather
+than on a wrong gradient, which is a confusing hour to spend.
+
 ## Telemetry
 
 A render shows where the robot ended up. It does not show why — the duty the
@@ -834,6 +895,8 @@ make test_fleet        # several MCUs per robot, messaging, routing, link faults
 make test_telemetry    # channel recording, axis scaling, panels (skips without matplotlib)
 make test_dataset      # randomisation determinism, line art, corpus verification
 make dataset           # generate a 64-sample corpus into /tmp/corpus
+make test_perception   # gradient check, the blank-page baseline, learning
+make train             # train Stage 1 on /tmp/corpus
 make test_all          # everything
 ```
 

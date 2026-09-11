@@ -46,13 +46,20 @@ test_telemetry:
 test_dataset:
 	cd tests && ./dataset_test.py
 
+test_perception:
+	cd tests && ./perception_test.py
+
 dataset:
 	cd tools && ./generate_dataset.py -- --samples 64 --out /tmp/corpus
 
-test_all: test test_anim test_joints test_drive test_record test_arm_record test_rig test_sensors test_lidar test_contact test_firmware test_fleet test_telemetry test_dataset
+train:
+	./tools/train_perception.py --corpus /tmp/corpus --epochs 40
+
+test_all: test test_anim test_joints test_drive test_record test_arm_record test_rig test_sensors test_lidar test_contact test_firmware test_fleet test_telemetry test_dataset test_perception
 
 install:
 	chmod +x robotsim.py
 	chmod +x headless.py
 	chmod +x tests/*.py
+	chmod +x tools/*.py
 	sudo apt-get install blender
