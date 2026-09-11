@@ -40,6 +40,8 @@ def main():
     ap.add_argument('--limit', type=int, default=None)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--target', default='lineart')
+    ap.add_argument('--tolerance', type=int, default=1,
+                    help='matching tolerance in pixels for the tolerant score')
     args = ap.parse_args()
 
     corpus = Corpus(args.corpus, size=tuple(args.size), limit=args.limit)
@@ -64,12 +66,19 @@ def main():
     ## validation set is how a tuned threshold becomes an inflated score.
     threshold, _ = best_threshold(net, xtr, ytr)
     print('\nthreshold %.2f (chosen on train)' % threshold)
+    ## Both scores, strict first. Strokes are one pixel wide, so a prediction
+    ## that traces a contour perfectly but one pixel off scores zero strictly:
+    ## the strict number measures localisation as much as detection, and the
+    ## tolerant one -- how boundary detection is normally scored -- separates
+    ## them. Neither is quoted without the other.
     for name, (x, y) in (('train', (xtr, ytr)), ('val', (xva, yva))):
-        r = evaluate(net, x, y, threshold)
-        print('%-5s  F1 %.3f   precision %.3f   recall %.3f   accuracy %.3f   '
-              'blank-page F1 %.3f'
-              % (name, r['f1'], r['precision'], r['recall'], r['accuracy'],
-                 r['baseline_f1']))
+        strict = evaluate(net, x, y, threshold)
+        loose = evaluate(net, x, y, threshold, tolerance=args.tolerance)
+        print('%-5s  strict F1 %.3f (P %.3f R %.3f)   within %dpx F1 %.3f '
+              '(P %.3f R %.3f)   blank page %.3f'
+              % (name, strict['f1'], strict['precision'], strict['recall'],
+                 args.tolerance, loose['f1'], loose['precision'], loose['recall'],
+                 strict['baseline_f1']))
 
     net.save(args.out)
     print('\nweights -> %s' % args.out)

@@ -61,6 +61,12 @@ def main(argv):
     ap.add_argument('--no-lineart', action='store_true')
     ap.add_argument('--keep-going', action='store_true',
                     help='report bad samples instead of stopping at the first')
+    ap.add_argument('--shard', type=int, default=0,
+                    help='which slice of the corpus this process generates')
+    ap.add_argument('--shards', type=int, default=1,
+                    help='how many processes are generating in total')
+    ap.add_argument('--no-verify', action='store_true',
+                    help='skip verification (a shard cannot verify the whole)')
     args = ap.parse_args(argv)
 
     resolution = (args.width, args.height)
@@ -86,15 +92,23 @@ def main(argv):
     rnd = Randomizer(seed=args.seed, extent=args.extent)
     line = LineArt(thickness=1.1)
 
+    ## Each shard owns a disjoint set of indices and its own manifest. Only
+    ## shard 0 may clear the directory, and only because the launcher runs it
+    ## before the others start -- a shard wiping the output while its siblings
+    ## are writing into it is the obvious way to lose a corpus.
+    sharded = args.shards > 1
     ds = Dataset(args.out, passes=tuple(passes), split=args.split,
-                 overwrite=True, note='robotsim procedural corpus')
+                 overwrite=not sharded, note='robotsim procedural corpus',
+                 manifest=('manifest.%03d.jsonl' % args.shard) if sharded else None)
     for token, index in SEGMENT_CLASSES.items():
         ds.label(token, index)
     ds.label('obstacle', OBSTACLE_LABEL)
 
-    print('generating %d samples -> %s' % (args.samples, args.out))
+    indices = [i for i in range(args.samples) if i % args.shards == args.shard]
+    print('generating %d samples (shard %d/%d) -> %s'
+          % (len(indices), args.shard, args.shards, args.out))
     started = time.time()
-    for i in range(args.samples):
+    for done, i in enumerate(indices):
         seed = args.seed * 1000003 + i
         rnd.reseed(seed)
 
@@ -107,6 +121,11 @@ def main(argv):
         rnd.pose(bot.root, area=max(1.0, args.extent * 0.3), z=0.15)
         rnd.camera(camera, looking_at=(0, 0, 0.6),
                    distance=(args.extent * 0.4, args.extent * 1.1))
+        ## Pin the sampler to the sample's own seed, so a frame does not depend
+        ## on how many frames preceded it in this process -- which is what makes
+        ## the corpus independent of how it was sharded across workers.
+        if hasattr(bpy.context.scene, 'cycles'):
+            bpy.context.scene.cycles.seed = seed % (2 ** 31)
         bpy.context.view_layer.update()
 
         files = {}
@@ -139,14 +158,19 @@ def main(argv):
                        'rgb_engine': args.rgb_engine},
                  **files)
 
-        if (i + 1) % 25 == 0 or i + 1 == args.samples:
-            rate = (time.time() - started) / (i + 1)
-            print('  %d/%d  %.2f s/sample' % (i + 1, args.samples, rate))
+        if (done + 1) % 25 == 0 or done + 1 == len(indices):
+            rate = (time.time() - started) / (done + 1)
+            print('  %d/%d  %.2f s/sample' % (done + 1, len(indices), rate))
 
     ds.close()
     elapsed = time.time() - started
     print('wrote %d samples in %.1fs (%.2f s/sample)'
           % (ds.count, elapsed, elapsed / max(1, ds.count)))
+
+    if args.no_verify or sharded:
+        ## A shard holds only its own manifest, so it cannot check the corpus.
+        ## The launcher verifies after merging.
+        return 0
 
     problems = ds.verify()
     if problems:
