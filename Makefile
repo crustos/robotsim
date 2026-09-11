@@ -43,7 +43,13 @@ test_fleet:
 test_telemetry:
 	cd tests && ./telemetry_test.py
 
-test_all: test test_anim test_joints test_drive test_record test_arm_record test_rig test_sensors test_lidar test_contact test_firmware test_fleet test_telemetry
+test_dataset:
+	cd tests && ./dataset_test.py
+
+dataset:
+	cd tools && ./generate_dataset.py -- --samples 64 --out /tmp/corpus
+
+test_all: test test_anim test_joints test_drive test_record test_arm_record test_rig test_sensors test_lidar test_contact test_firmware test_fleet test_telemetry test_dataset
 
 install:
 	chmod +x robotsim.py

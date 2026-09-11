@@ -79,6 +79,9 @@ while RobotSim.callbacks:
 | `robotsim.SensorRig` | yes | Multi-pass capture. Owns the compositor graph that turns one render into RGB, depth and segmentation files. |
 | `sensors.py` | yes | `Lidar` and `LidarScan`. Ray-cast ranging with per-beam labels, independent of the render path. |
 | `contact.py` | yes | `RayContact`. Ground following, collision and slip by ray casting, behind the `drive.ContactModel` seam. |
+| `npr.py` | yes | Non-photorealistic line art. Flattens the scene and renders structure only. |
+| `randomize.py` | yes | Seeded domain randomisation: layout, materials, lighting, viewpoint. |
+| `dataset.py` | **no** | Corpus writer. Aligned samples, a manifest that explains them, and verification. |
 | `telemetry.py` | **no** | Records channels per tick and draws them as a matplotlib panel with the firmware console attached. Optional: only drawing needs matplotlib. |
 | `firmware.py` | **no** | Real C/C++ firmware in the loop via crust's hostsim, and the `Network` bus between boards. Optional: does nothing unless crust is cloned beside robotsim. |
 | `ros2/joint_export.py` | yes | Exports a recorded arm motion as a ROS2-style joint trajectory (JSON or text). |
@@ -684,6 +687,77 @@ loses messages exactly as it would on a real link. `nav_node.c` notices the
 silence and says so; a simulation that cannot drop messages would never have
 shown that.
 
+## Datasets
+
+The pipeline this simulator exists to feed needs aligned multi-modal samples: a
+photorealistic image, the structural abstraction of the same frame, and the
+semantic and depth maps that label it. `tools/generate_dataset.py` produces them.
+
+```sh
+make dataset                                  # 64 samples into /tmp/corpus
+./tools/generate_dataset.py -- --samples 5000 --out /data/corpus
+```
+
+Each sample is one randomised scene rendered from one viewpoint four ways:
+
+| Pass | Format | Contents |
+| --- | --- | --- |
+| `rgb` | PNG | the messy input a perception network must cope with |
+| `lineart` | PNG | structure only — no texture, shadow or colour survives |
+| `segmentation` | 32-bit EXR | integer class index per pixel |
+| `depth` | 32-bit EXR | metres |
+
+### Reproducibility
+
+Every choice comes from a seeded generator owned by `randomize.py`, never from
+global random state, and each sample's seed is stored in its manifest entry. A
+sample that looks wrong during training can be regenerated on its own, without
+rerunning the corpus. `Randomizer(seed).scene()` twice gives identical layouts;
+`test_dataset` asserts it.
+
+One ordering trap is worth knowing: `scene()` clears everything the randomizer
+previously created, **lights included**. Create the scene first, then the
+lights.
+
+### The manifest is the dataset
+
+`manifest.jsonl` carries one line per sample: its files, its seed, the camera,
+and the label map in force when it was written. That last item is what turns the
+ObjectID pass from an image into a semantic map — pixel value 7 means nothing
+alone, and means `obstacle` only because the manifest says so *for that sample*.
+Storing it per sample rather than once per corpus means a corpus whose labelling
+changed halfway through is still readable instead of silently mislabelled.
+
+JSON Lines rather than one document, because a run that dies at sample 40,000
+should leave 40,000 usable samples rather than an unterminated array.
+
+### Verification looks at pixels
+
+```python
+problems = ds.verify()    # [] when the corpus is sound
+```
+
+Alignment is the premise of the whole pipeline, and modalities that disagree on
+resolution train a network to a systematic offset it can never recover from. So
+`verify()` re-opens what was written and checks sizes agree — and checks the RGB
+has tonal range, because **an unlit render is the corruption that looks like
+success**: the file exists, the resolution matches, the manifest is complete, and
+every pixel is black.
+
+### Engines
+
+The passes do not all come from one renderer. Depth and object index are
+geometric and only Cycles exposes the object-index pass. Line art uses a flat
+emission override, so it needs no lighting. The photorealistic pass is the one
+that actually needs lights to work — and on the Blender packaged with this
+container, **no light type illuminates a diffuse surface under Cycles**, so RGB
+comes out black while depth and segmentation are perfectly correct. That is a
+stripped build rather than a scene problem, but it is exactly the failure that
+produces a large, well-formed, useless corpus.
+
+So `--rgb-engine` defaults to EEVEE and `--rgb-engine cycles` restores the
+single-engine path on a full build. The exposure check exists because of this.
+
 ## Telemetry
 
 A render shows where the robot ended up. It does not show why — the duty the
@@ -758,6 +832,8 @@ make test_contact      # ground following, blocking, sliding, ramps, slip
 make test_firmware     # real C/C++ firmware in the loop (skips without crust)
 make test_fleet        # several MCUs per robot, messaging, routing, link faults
 make test_telemetry    # channel recording, axis scaling, panels (skips without matplotlib)
+make test_dataset      # randomisation determinism, line art, corpus verification
+make dataset           # generate a 64-sample corpus into /tmp/corpus
 make test_all          # everything
 ```
 
