@@ -52,6 +52,9 @@ test_perception:
 dataset:
 	cd tools && ./generate_dataset.py -- --samples 64 --out /tmp/corpus
 
+corpus:
+	./tools/generate_corpus.py --samples 512 --out /tmp/corpus --prune
+
 train:
 	./tools/train_perception.py --corpus /tmp/corpus --epochs 40
 

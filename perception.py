@@ -134,28 +134,36 @@ class Corpus:
 # layers
 # ---------------------------------------------------------------------------
 
-def im2col(x, k, pad):
-    """(N,C,H,W) -> (N, C*k*k, H*W) with zero padding, for convolution as matmul."""
+def im2col(x, k, pad, dilation=1):
+    """
+    (N,C,H,W) -> (N, C*k*k, H*W) with zero padding, for convolution as matmul.
+
+    `dilation` spaces the taps apart, which widens the receptive field without
+    adding parameters or losing resolution -- the cheap way to let a pixel see
+    further when the answer depends on context rather than on detail.
+    """
     n, c, h, w = x.shape
     padded = np.pad(x, ((0, 0), (0, 0), (pad, pad), (pad, pad)))
     cols = np.empty((n, c * k * k, h * w), dtype=x.dtype)
     idx = 0
     for dy in range(k):
         for dx in range(k):
-            patch = padded[:, :, dy:dy + h, dx:dx + w]
+            oy, ox = dy * dilation, dx * dilation
+            patch = padded[:, :, oy:oy + h, ox:ox + w]
             cols[:, idx:idx + c, :] = patch.reshape(n, c, h * w)
             idx += c
     return cols
 
 
-def col2im(cols, shape, k, pad):
+def col2im(cols, shape, k, pad, dilation=1):
     """Adjoint of im2col: scatter-add gradients back to image positions."""
     n, c, h, w = shape
     out = np.zeros((n, c, h + 2 * pad, w + 2 * pad), dtype=cols.dtype)
     idx = 0
     for dy in range(k):
         for dx in range(k):
-            out[:, :, dy:dy + h, dx:dx + w] += cols[:, idx:idx + c, :].reshape(n, c, h, w)
+            oy, ox = dy * dilation, dx * dilation
+            out[:, :, oy:oy + h, ox:ox + w] += cols[:, idx:idx + c, :].reshape(n, c, h, w)
             idx += c
     return out[:, :, pad:pad + h, pad:pad + w] if pad else out
 
@@ -163,7 +171,7 @@ def col2im(cols, shape, k, pad):
 class Conv2d:
     """A 3x3-style convolution, same padding, implemented as one matmul."""
 
-    def __init__(self, in_ch, out_ch, k=3, rng=None, dtype=np.float32):
+    def __init__(self, in_ch, out_ch, k=3, rng=None, dtype=np.float32, dilation=1):
         rng = rng or np.random.default_rng(0)
         ## He initialisation: with ReLU throwing away half the signal, scaling
         ## by sqrt(2/fan_in) keeps activations from collapsing as depth grows.
@@ -176,7 +184,10 @@ class Conv2d:
         self.w = (rng.standard_normal((out_ch, fan_in)) * math.sqrt(2.0 / fan_in)).astype(dtype)
         self.b = np.zeros(out_ch, dtype=dtype)
         self.k = k
-        self.pad = k // 2
+        self.dilation = dilation
+        ## 'Same' padding must grow with the dilation, or a dilated layer
+        ## silently crops the image and every later layer is misaligned.
+        self.pad = (k // 2) * dilation
         self.in_ch = in_ch
         self.out_ch = out_ch
         self.cache = None
@@ -188,7 +199,7 @@ class Conv2d:
 
     def forward(self, x):
         n, c, h, w = x.shape
-        cols = im2col(x, self.k, self.pad)                  # (N, C*k*k, HW)
+        cols = im2col(x, self.k, self.pad, self.dilation)   # (N, C*k*k, HW)
         out = np.einsum('of,nfp->nop', self.w, cols) + self.b[None, :, None]
         self.cache = (x.shape, cols)
         return out.reshape(n, self.out_ch, h, w)
@@ -200,7 +211,7 @@ class Conv2d:
         self.dw[...] = np.einsum('nop,nfp->of', g, cols)
         self.db[...] = g.sum(axis=(0, 2))
         dcols = np.einsum('of,nop->nfp', self.w, g)
-        return col2im(dcols, shape, self.k, self.pad)
+        return col2im(dcols, shape, self.k, self.pad, self.dilation)
 
 
 class ReLU:
@@ -228,13 +239,24 @@ class LineArtNet:
     artefacts that upsampling introduces on thin strokes.
     """
 
-    def __init__(self, width=12, depth=3, seed=0, in_ch=3, dtype=np.float32):
+    def __init__(self, width=12, depth=3, seed=0, in_ch=3, dtype=np.float32,
+                 dilations=None):
         rng = np.random.default_rng(seed)
         self.dtype = dtype
         self.layers = []
         channels = in_ch
-        for _ in range(max(1, depth - 1)):
-            self.layers.append(Conv2d(channels, width, rng=rng, dtype=dtype))
+        ## Dilations widen the receptive field geometrically instead of
+        ## linearly. Five plain 3x3 layers see 11 pixels; the same five with
+        ## dilations 1,2,4,8 see 63, which is most of a 64-wide image -- and
+        ## whether an edge is an object boundary is a question about context,
+        ## not about the pixel.
+        hidden = max(1, depth - 1)
+        if dilations is None:
+            dilations = [1] * hidden
+        dilations = list(dilations)[:hidden] + [1] * max(0, hidden - len(dilations))
+        self.dilations = dilations
+        for d in dilations:
+            self.layers.append(Conv2d(channels, width, rng=rng, dtype=dtype, dilation=d))
             self.layers.append(ReLU())
             channels = width
         ## Final layer emits one logit per pixel; the sigmoid lives in the loss,
@@ -335,7 +357,50 @@ def suggested_ink_weight(targets, cap=40.0):
 # metrics
 # ---------------------------------------------------------------------------
 
-def scores(pred, targets, threshold=0.5):
+def dilate(mask, radius=1):
+    """
+    Grow a boolean mask by `radius` pixels, without scipy.
+
+    Implemented as shifted ORs: for the radii used here (one or two pixels) that
+    is a handful of array operations, and it keeps this module dependency-free.
+    """
+    if radius <= 0:
+        return mask
+    out = mask.copy()
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dy == 0 and dx == 0:
+                continue
+            shifted = np.roll(np.roll(mask, dy, axis=-2), dx, axis=-1)
+            ## Rolled-in edges wrap around, which would match a stroke on the
+            ## opposite side of the image. Blank the wrapped band.
+            if dy > 0:
+                shifted[..., :dy, :] = False
+            elif dy < 0:
+                shifted[..., dy:, :] = False
+            if dx > 0:
+                shifted[..., :, :dx] = False
+            elif dx < 0:
+                shifted[..., :, dx:] = False
+            out |= shifted
+    return out
+
+
+def scores(pred, targets, threshold=0.5, tolerance=0):
+    """
+    Precision, recall and F1 over ink pixels.
+
+    `tolerance` allows a match within that many pixels, which is how boundary
+    detection is normally scored. The reason is specific to this target: strokes
+    are one pixel wide, so a prediction that traces a contour perfectly but one
+    pixel to the left scores *zero* on both precision and recall for that
+    contour. At tolerance 0 the metric is measuring localisation as much as
+    detection, and the two are worth separating before concluding a model cannot
+    see edges.
+
+    Strict (tolerance 0) remains the default, because a tolerant score is easy
+    to quote without the qualifier and should never be the headline by accident.
+    """
     """
     Precision, recall and F1 over ink pixels, plus accuracy for contrast.
 
@@ -344,6 +409,23 @@ def scores(pred, targets, threshold=0.5):
     """
     p = pred > threshold
     t = targets > 0.5
+    if tolerance:
+        ## A prediction counts if a true stroke is near it, and a true stroke
+        ## counts if a prediction is near it. Scored against separately dilated
+        ## masks rather than one, or a thick blob would earn recall it has not
+        ## demonstrated.
+        near_true = dilate(t, tolerance)
+        near_pred = dilate(p, tolerance)
+        tp_p = float(np.sum(p & near_true))
+        tp_r = float(np.sum(t & near_pred))
+        fp = float(np.sum(p & ~near_true))
+        fn = float(np.sum(t & ~near_pred))
+        precision = tp_p / (tp_p + fp) if tp_p + fp else 0.0
+        recall = tp_r / (tp_r + fn) if tp_r + fn else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        return {'precision': precision, 'recall': recall, 'f1': f1,
+                'accuracy': float(np.mean(p == t)), 'ink_fraction': ink_fraction(targets),
+                'tolerance': tolerance}
     tp = float(np.sum(p & t))
     fp = float(np.sum(p & ~t))
     fn = float(np.sum(~p & t))
@@ -394,12 +476,12 @@ def best_threshold(net, x, y, candidates=None, batch=8):
     return best, best_f1
 
 
-def evaluate(net, x, y, threshold=0.5, batch=8):
+def evaluate(net, x, y, threshold=0.5, batch=8, tolerance=0):
     preds = []
     for i in range(0, len(x), batch):
         preds.append(net.predict(x[i:i + batch]))
     pred = np.concatenate(preds) if preds else np.zeros_like(y)
-    result = scores(pred, y, threshold)
+    result = scores(pred, y, threshold, tolerance)
     result['baseline_f1'] = blank_baseline(y)['f1']
     return result
 

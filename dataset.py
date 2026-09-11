@@ -52,7 +52,7 @@ class Dataset:
     INFO = 'dataset.json'
 
     def __init__(self, root, passes=('rgb', 'depth', 'segmentation'), split='train',
-                 labels=None, overwrite=False, note=''):
+                 labels=None, overwrite=False, note='', manifest=None):
         self.root = os.path.abspath(root)
         self.split = split
         self.passes = tuple(passes)
@@ -60,6 +60,11 @@ class Dataset:
         self.note = note
         self.count = 0
         self._handle = None
+        ## Shards write separate manifests and are merged afterwards. Appending
+        ## to one file from several processes would interleave partial lines:
+        ## the writes are small, but "small enough that it probably works" is
+        ## not a property a corpus should depend on.
+        self.manifest_name = manifest or self.MANIFEST
         if overwrite and os.path.isdir(self.root):
             shutil.rmtree(self.root)
         os.makedirs(self.sample_dir, exist_ok=True)
@@ -80,7 +85,7 @@ class Dataset:
 
     @property
     def manifest_path(self):
-        return os.path.join(self.root, self.MANIFEST)
+        return os.path.join(self.root, self.manifest_name)
 
     # -- labels -------------------------------------------------------------
 
@@ -153,6 +158,30 @@ class Dataset:
         self._handle.flush()
         self.count += 1
         return entry
+
+    def prune(self, indices):
+        """
+        Drop samples from the manifest, leaving their files on disk.
+
+        Randomised generation occasionally produces a sample with nothing in it
+        -- a viewpoint that happened to face empty sky, a lighting draw that
+        washed the frame flat. One such sample should not invalidate the other
+        four hundred, and deleting it by hand is how a corpus quietly stops
+        matching its manifest. The files are left alone so a dropped sample can
+        still be looked at to understand why it was dropped.
+        """
+        indices = set(indices)
+        if not indices:
+            return 0
+        kept = [e for e in self.entries() if e['index'] not in indices]
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+        with open(self.manifest_path, 'w') as fh:
+            for entry in kept:
+                fh.write(json.dumps(entry, sort_keys=True) + '\n')
+        self.count = len(kept)
+        return len(indices)
 
     def close(self):
         if self._handle is not None:
@@ -247,6 +276,65 @@ class Dataset:
                                     '(spread %.3f) -- unlit or blown out'
                                     % (index, spread))
         return problems
+
+
+def indices_in(problems):
+    """Sample indices mentioned by verify(), for pruning."""
+    import re
+    out = set()
+    for text in problems:
+        match = re.search(r'sample (\d+)', text)
+        if match:
+            out.add(int(match.group(1)))
+    return out
+
+
+def merge_manifests(root, pattern='manifest.*.jsonl', out=None, remove=True):
+    """
+    Combine shard manifests into one, ordered by sample index.
+
+    Sorted by index rather than by shard, so the deterministic train/validation
+    split by position means the same thing however many workers produced the
+    corpus -- otherwise the split silently changes with the worker count, and
+    two runs that should be comparable are not.
+    """
+    import glob
+    out = out or os.path.join(root, Dataset.MANIFEST)
+    shards = [p for p in sorted(glob.glob(os.path.join(root, pattern)))
+              if os.path.abspath(p) != os.path.abspath(out)]
+    if not shards:
+        ## Nothing to merge. Returning without writing matters: an unsharded run
+        ## has already written the real manifest, and truncating it here would
+        ## leave a corpus whose files all exist and whose index is empty.
+        return len(read_manifest(out)) if os.path.isfile(out) else 0
+    entries = []
+    for path in shards:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    entries.append(json.loads(line))
+    entries.sort(key=lambda e: e['index'])
+    with open(out, 'w') as fh:
+        for entry in entries:
+            fh.write(json.dumps(entry, sort_keys=True) + '\n')
+    if remove:
+        for path in shards:
+            os.remove(path)
+    return len(entries)
+
+
+def read_manifest(path):
+    """Every entry in a manifest file, or [] if it is not there."""
+    if not os.path.isfile(path):
+        return []
+    out = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
 
 
 def _image_size(path):

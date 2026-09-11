@@ -708,6 +708,33 @@ Each sample is one randomised scene rendered from one viewpoint four ways:
 | `segmentation` | 32-bit EXR | integer class index per pixel |
 | `depth` | 32-bit EXR | metres |
 
+### Generating in parallel
+
+```sh
+./tools/generate_corpus.py --samples 5000 --out /data/corpus --workers 8 --prune
+```
+
+Each sample is an independent scene built from its own seed, so workers are
+separate processes with nothing shared: worker `k` takes the samples where
+`index % workers == k` and writes its own manifest, which are merged and sorted
+by index afterwards. Nothing appends to a shared file, so there is no
+interleaving to get subtly wrong under load.
+
+Scene *content* depends on the index alone, so geometry, materials, lighting and
+viewpoint are identical whatever the worker count -- measured bit-identical for
+the photorealistic, depth and segmentation passes. **The line pass is the
+exception:** Blender's stroke renderer carries state between renders within a
+process, so changing how samples are divided shifts a few strokes by up to one
+pixel (mean 0.5/255). It is bit-identical on rerun at a *fixed* worker count, so
+reproducing a corpus exactly needs the seed **and** the worker count -- both are
+recorded in `dataset.json`.
+
+`--prune` drops samples that fail verification instead of failing the run. On a
+480-sample corpus one sample came out featureless (mean 215.9, standard
+deviation 0.44 -- a viewpoint that happened to face empty sky), which is roughly
+what to expect at that rate. Pruned samples keep their files on disk so they can
+still be looked at.
+
 ### Reproducibility
 
 Every choice comes from a seeded generator owned by `randomize.py`, never from
@@ -785,21 +812,53 @@ of the module rather than details of it:
 - the reported metric is F1 over ink pixels, never accuracy, and every score is
   printed beside what the blank page achieves on the same data.
 
-Measured on a 140-sample corpus at 64x48, 70 epochs:
+Measured on a 479-sample corpus at 64x48, 48 epochs, on 96 validation samples:
 
 | | F1 | precision | recall | accuracy |
 | --- | --- | --- | --- | --- |
 | blank page | 0.000 | — | 0.000 | 0.988 |
-| trained | **0.341** | 0.232 | 0.645 | 0.970 |
+| trained, strict | 0.308 | 0.196 | 0.720 | 0.970 |
+| trained, within 1px | **0.641** | 0.497 | 0.905 | — |
+| trained, within 2px | 0.734 | 0.604 | 0.935 | — |
 
 The trained model's *accuracy is worse than the blank page's* while its F1 goes
 from nothing to a third. That row is the argument for the metric choice, in one
 line.
 
-Threshold tuning was tried and did not help: chosen on training data it gave
-0.325 on validation against 0.341 at the default, so the default stands. Choosing
-it on the validation set would have "improved" the number, which is how a tuned
-threshold becomes an inflated score.
+### Strict and tolerant scores
+
+Strokes are one pixel wide, so a prediction that traces a contour perfectly but
+one pixel to the left scores **zero** on both precision and recall for that
+contour. The strict number is therefore measuring localisation as much as
+detection. Allowing a small matching tolerance -- how boundary detection is
+normally scored -- separates the two, and the jump from 0.308 to 0.641 says the
+network is finding the edges and placing them within a pixel.
+
+Both are always reported together. A tolerant score is easy to quote without the
+qualifier, and `test_perception` pins the two ways it could be abused: a
+one-pixel-shifted perfect trace must go from 0.0 to 1.0, and predicting ink
+everywhere must *not* score well (recall 1.000, precision 0.164, F1 0.282).
+
+### What the bottleneck is not
+
+Three hypotheses were tested and two were wrong, which is worth recording so
+they are not tried again:
+
+- **More data.** Going from 140 to 479 samples did not raise the score. Train F1
+  0.367 against val F1 0.305 -- a gap of 0.06 -- means the model cannot fit the
+  training set either. That is underfitting, so the corpus was never the limit.
+- **Receptive field.** Five 3x3 layers see 11 pixels, which sounded too local to
+  judge an object boundary. Dilations of 1,2,4,8 widen that to 63 pixels and
+  scored *worse* at matched epochs (0.256 vs 0.279 at 12 epochs, 0.307 vs 0.326
+  at 24). `--dilations` remains available; it is not the answer here.
+- **Threshold.** Tuned on training data it gave 0.325 on validation against
+  0.341 at the default, so the default stands. Choosing it on the validation set
+  would have "improved" the number, which is how a tuned threshold becomes an
+  inflated score.
+
+What remains: capacity (24 channels is small), and the loss -- an exact-pixel
+target punishes a one-pixel miss as hard as a total one, and the tolerance
+analysis above says that is exactly the error the model is making.
 
 ### Why numpy rather than torch
 
@@ -897,6 +956,7 @@ make test_dataset      # randomisation determinism, line art, corpus verificatio
 make dataset           # generate a 64-sample corpus into /tmp/corpus
 make test_perception   # gradient check, the blank-page baseline, learning
 make train             # train Stage 1 on /tmp/corpus
+make corpus            # parallel corpus generation across CPUs
 make test_all          # everything
 ```
 

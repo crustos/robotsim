@@ -70,10 +70,27 @@ class Randomizer:
     # -- scene contents -----------------------------------------------------
 
     def clear(self):
-        """Remove everything this randomizer made, leaving the rest alone."""
+        """
+        Remove everything this randomizer made, leaving the rest alone.
+
+        The object's data is freed too, not just the object. Removing an object
+        orphans its mesh or lamp datablock rather than deleting it, and over a
+        corpus of thousands of scenes those orphans accumulate into real memory.
+        They also take the names with them: the next cube becomes `RND.CUBE.001`
+        because the old one still holds `RND.CUBE`, so identical scenes end up
+        with differently-named objects, which perturbs render ordering and makes
+        a corpus depend on how many samples preceded it.
+        """
         for obj in self.created:
             try:
+                data = getattr(obj, 'data', None)
+                kind = getattr(obj, 'type', None)
                 bpy.data.objects.remove(obj, do_unlink=True)
+                if data is not None and getattr(data, 'users', 0) == 0:
+                    if kind == 'MESH':
+                        bpy.data.meshes.remove(data)
+                    elif kind == 'LIGHT':
+                        bpy.data.lights.remove(data)
             except (ReferenceError, RuntimeError):
                 pass
         self.created = []
