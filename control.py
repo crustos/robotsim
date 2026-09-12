@@ -185,7 +185,7 @@ class ControlNet:
     """
 
     def __init__(self, width=12, depth=3, seed=0, in_ch=3, dtype=np.float32,
-                 hidden=32, bins=4):
+                 hidden=32, bins=8):
         from perception import Conv2d, ReLU, BandPool, Linear
         rng = np.random.default_rng(seed)
         self.dtype = dtype
@@ -197,7 +197,11 @@ class ControlNet:
             channels = width
         ## Banded rather than global: see BandPool. A single mean over the
         ## frame cannot say which side the goal is on, and steering is entirely
-        ## a question about which side the goal is on.
+        ## a question about which side the goal is on. Eight bins rather than
+        ## four because the difference is measurable -- val MAE 0.111 against
+        ## 0.131 on the same split -- and because the quantity being recovered
+        ## is a horizontal position, so the resolution of the pooling is the
+        ## resolution of the answer.
         self.pool = BandPool(bins=bins)
         self.fc1 = Linear(channels * bins, hidden, rng=rng, dtype=dtype)
         self.act1 = ReLU()

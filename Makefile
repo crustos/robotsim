@@ -79,6 +79,21 @@ muble_corpus:
 	cd tools && ./generate_dataset.py -- --samples 64 --out /tmp/muble_corpus \
 		--muble-scenes /tmp/muble_handoff --muble-root $(abspath $(MUBLE))
 
+## Does the control policy still want more data? Trains on increasing
+## fractions of the episodes against a fixed held-out set.
+scale_control:
+	python3 tools/scale_control.py --corpus /tmp/control
+
+## Stage 2 end to end: expert rollouts -> behaviour cloning -> closed loop.
+control_corpus:
+	cd tools && ./generate_control.py -- --episodes 30 --steps 14 --out /tmp/control
+
+control_policy:
+	python3 tools/train_control.py --corpus /tmp/control --epochs 35
+
+control_eval:
+	cd tools && ./evaluate_control.py -- --episodes 8 --policy /tmp/control_net.npz
+
 muble_handoff:
 	$(MUBLE)/robotsim_export.py \
 		$(MUBLE)/demo_output/scene_generaion/NS_AP_scenes.json \

@@ -396,7 +396,7 @@ class BandPool:
     which the other channels already carry.
     """
 
-    def __init__(self, bins=4):
+    def __init__(self, bins=8):
         self.bins = bins
         self.shape = None
         self.edges = None
@@ -404,23 +404,47 @@ class BandPool:
     def params(self):
         return ()
 
+    def spans(self, width):
+        """
+        Column range for each bin, guaranteed non-empty.
+
+        When the feature map is narrower than the bin count -- which happens on
+        small inputs, and in tests -- evenly spaced edges produce empty bins,
+        and the mean of an empty slice is NaN. Widening those bins to one column
+        keeps every bin defined and keeps the output width fixed, which matters
+        because the following Linear layer's shape is decided at construction
+        and cannot change with the input.
+        """
+        out = []
+        for b in range(self.bins):
+            lo = (b * width) // self.bins
+            hi = ((b + 1) * width) // self.bins
+            if hi <= lo:
+                ## Overlap rather than emit nothing; adjacent bins then share a
+                ## column, which is the honest answer when the map is narrower
+                ## than the number of questions being asked of it.
+                lo = min(lo, max(0, width - 1))
+                hi = lo + 1
+            out.append((lo, hi))
+        return out
+
     def forward(self, x):
         n, c, h, w = x.shape
         self.shape = x.shape
-        self.edges = np.linspace(0, w, self.bins + 1).astype(int)
+        self.edges = self.spans(w)
         out = np.empty((n, c * self.bins), dtype=x.dtype)
-        for b in range(self.bins):
-            lo, hi = self.edges[b], self.edges[b + 1]
+        for b, (lo, hi) in enumerate(self.edges):
             out[:, b * c:(b + 1) * c] = x[:, :, :, lo:hi].mean(axis=(2, 3))
         return out
 
     def backward(self, grad):
         n, c, h, w = self.shape
         out = np.zeros(self.shape, dtype=grad.dtype)
-        for b in range(self.bins):
-            lo, hi = self.edges[b], self.edges[b + 1]
-            share = grad[:, b * c:(b + 1) * c] / float(h * max(1, hi - lo))
-            out[:, :, :, lo:hi] = share[:, :, None, None]
+        for b, (lo, hi) in enumerate(self.edges):
+            share = grad[:, b * c:(b + 1) * c] / float(h * (hi - lo))
+            ## Accumulate, not assign: bins overlap when the map is narrow, and
+            ## assigning would silently drop one bin's gradient.
+            out[:, :, :, lo:hi] += share[:, :, None, None]
         return out
 
 
