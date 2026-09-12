@@ -953,6 +953,103 @@ numerical derivative is a difference of two nearly equal numbers, and in float32
 the cancellation swamps the result. The check then fails on arithmetic rather
 than on a wrong gradient, which is a confusing hour to spend.
 
+### Scene descriptions
+
+The simulator knows what every object is, where it is and which way up it is.
+The corpus throws that away — it keeps pixels and an integer per pixel, and the
+word `mug` never appears. `captions.py` keeps it, as a third supervision target:
+
+```python
+facts = captions.describe(objects, segmentation_pass)
+facts['text']   # 'The mug is near the camera, on the left. The wine glass is
+                #  far from the camera, tipped over on its side, on the right.'
+facts['props']  # ['mug:left', 'mug:near', 'wine glass:tipped', ...]
+```
+
+One rule governs what may be asserted: **only what is visible**. Every
+per-object fact is gated on that object's *rendered* pixel count in the
+object-index pass. A caption is supervision for a network whose only input is
+the image, so a proposition about something behind a cupboard is one the network
+cannot recover — training on it teaches guessing, because guessing is the only
+thing that lowers the loss. Image-space facts come from the mask rather than
+from projecting the camera matrix, for the same reason: projection says where an
+object *would* be, the mask says where it *is*.
+
+Propositions are **existential over category**, not per instance.
+`board:tipped` means *some* visible board is tipped, so a scene with two can
+carry both `board:tipped` and `board:upright` without contradiction. Per-instance
+targets would need stable identity across randomised scenes, which does not
+exist. The generated sentences disambiguate in words ("One board… another…").
+
+```sh
+# a corpus needs fallen objects before `tipped` can be learned at all
+cd tools && ./generate_dataset.py -- --samples 180 --tip 0.4 \
+    --muble-scenes /tmp/muble_handoff --out /tmp/corpus
+python3 tools/train_perception.py --corpus /tmp/corpus --captions
+```
+
+`--tip` is a prerequisite, not a nicety: every imported scene is upright, and a
+proposition with no positive examples cannot be learned — it contributes a
+constant to the loss and a zero to the score. On 180 samples with a 61-item
+vocabulary the description head reaches micro F1 0.346 against 0.191 for
+predicting each proposition's majority class.
+
+## Stage 2: control
+
+The other half of the chain: line drawing plus semantic map in, drive command
+out. It never sees a photograph, so there is no texture for it to overfit to.
+
+Labels come from behaviour cloning. A privileged expert (`control.Expert`) is
+given the true pose of the robot, the goal and every obstacle, and computes a
+command from a potential field. The student sees only the rendered abstraction
+from the robot's own camera and is trained to reproduce that command.
+
+```sh
+cd tools && ./generate_control.py -- --episodes 30 --steps 14 --out /tmp/control
+python3 tools/train_control.py --corpus /tmp/control --epochs 35
+cd tools && ./evaluate_control.py -- --episodes 8 --policy /tmp/control_net.npz
+```
+
+**Frame error is not a control result.** A cloned policy compounds its own small
+errors into states the expert never visited, so it can match the expert on every
+held-out frame and fail the moment it drives. `evaluate_control.py` puts the
+policy in the driving seat and scores whether it arrives:
+
+| driver | reached | mean final |
+|---|---|---|
+| expert (privileged) | 7/8 | 0.46 m |
+| policy (abstraction only) | 8/8 | 0.29 m |
+| drive straight ahead | 0/8 | 3.22 m |
+
+Driving straight is not a silly floor — a goal ahead of the robot is sometimes
+reached by accident, and a policy that cannot beat it has learned nothing about
+steering however good its frame error looks. The policy's 8/8 against the
+expert's 7/8 is one episode and is not evidence of beating the teacher.
+
+### Two things the control bottleneck was not
+
+Both are the intuitive first guess, and both are wrong. They are recorded in
+`tools/scale_control.py` so they are not retried.
+
+**Not the corpus size.** At 0/8 reached, the obvious reading was too little
+data. Doubling the corpus made the policy *worse* — validation error 0.197
+against 0.152 for predicting the training mean, so worse than ignoring the
+image. A scaling curve against a fixed held-out set is flat from 13 training
+episodes to 52.
+
+**It was the pooling.** The diagnostic was in the training column: the model
+could barely fit data it had already seen, while a unit test showed the same
+architecture memorising four frames to 0.002. `GlobalPool` takes a mean over the
+whole frame, which says how much goal is *visible* and not which side it is
+*on* — and steering is entirely a question of which side the goal is on. On the
+control corpus the goal's horizontal centroid correlates −0.765 with the
+expert's commanded yaw rate; the channel mean correlates −0.047. `BandPool`
+keeps horizontal position, and took training error from 0.141 to 0.057 and
+closed-loop success from 0/8 to 8/8.
+
+Use `GlobalPool` for questions about a whole frame (is anything tipped over),
+`BandPool` for questions about direction.
+
 ## Telemetry
 
 A render shows where the robot ended up. It does not show why — the duty the
@@ -1030,7 +1127,15 @@ make test_telemetry    # channel recording, axis scaling, panels (skips without 
 make test_dataset      # randomisation determinism, line art, corpus verification
 make dataset           # generate a 64-sample corpus into /tmp/corpus
 make test_perception   # gradient check, the blank-page baseline, learning
+make test_muble        # MuJoCo contact backend and the MuBlE bridge (no Blender)
+make test_muble_blender # appending MuBlE .blend assets, materials, a render
+make test_captions     # scene descriptions and the multi-task perception head
+make test_control_policy # Stage 2: expert, observation encoding, control net
 make train             # train Stage 1 on /tmp/corpus
+make control_corpus    # expert rollouts -> /tmp/control
+make control_policy    # clone the expert from the abstraction
+make control_eval      # closed loop: expert vs policy vs driving straight
+make scale_control     # does the policy still want more data? (it does not)
 make corpus            # parallel corpus generation across CPUs
 make test_all          # everything
 ```
@@ -1074,11 +1179,18 @@ Working today:
 
 Not yet built:
 
+- **Composing the two stages.** Stage 2 is trained and evaluated on *rendered*
+  line art, not on Stage 1's predictions, so the chain has not actually been run
+  end to end through its own perception. The cost of that composition is exactly
+  what a sceptic would ask about, and it has not been paid.
+- **The ablation the whole thing is for**: a photorealistic baseline against the
+  chained policy under appearance shift. Both stages now exist and are measured,
+  so this is an experiment rather than a proposal — but it has not been run.
 - Dynamics *in the default backend*: `contact.RayContact` still has no mass,
   traction or forces, and its momentum is an acceleration limit rather than an
   integrated one. `muble.MujocoContact` has all three — see
-  [MuJoCo contact](#mujoco-contact-optional) — but it is opt-in, and the
-  procedural corpus is still generated kinematically.
+  [MuJoCo contact](#mujoco-contact-optional) — but it is opt-in, and every
+  corpus reported here was generated kinematically.
 - Proximity/contact sensors (RGB, depth, segmentation and lidar are done)
 - The armulator path: register-level driver verification, offline
 - The PyTorch training loop and Jetson deployment path
