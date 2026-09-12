@@ -266,7 +266,28 @@ def test_rollout_reports_failure_honestly():
           % (through['closest'], through['final_distance']))
 
 
-TESTS = [test_expert_reaches_an_open_goal, test_expert_avoids_an_obstacle_in_the_way,
+def test_band_pool_survives_a_narrow_map():
+    """
+    More bins than columns must not produce NaN.
+
+    Evenly spaced edges over a map narrower than the bin count leave empty
+    bins, and the mean of an empty slice is NaN -- which propagates silently
+    through the whole network and shows up as a loss that never moves.
+    """
+    from perception import BandPool
+    pool = BandPool(bins=8)
+    x = np.random.default_rng(0).random((2, 3, 4, 5)).astype(np.float64)
+    out = pool.forward(x)
+    assert out.shape == (2, 3 * 8), out.shape
+    assert np.isfinite(out).all(), 'NaN from an empty bin'
+    back = pool.backward(np.ones_like(out))
+    assert back.shape == x.shape and np.isfinite(back).all()
+    ## Overlapping bins accumulate; a column shared by two bins gets both.
+    assert back.sum() > 0
+    print('  8 bins over a 5-wide map: finite, shape %s' % (out.shape,))
+
+
+TESTS = [test_band_pool_survives_a_narrow_map, test_expert_reaches_an_open_goal, test_expert_avoids_an_obstacle_in_the_way,
          test_expert_stops_on_arrival, test_expert_turns_before_driving,
          test_yaw_convention_matches_the_simulator, test_observation_channels,
          test_action_round_trip, test_control_gradients,
