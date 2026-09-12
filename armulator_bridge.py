@@ -336,9 +336,15 @@ class DriveReport:
     robot, so `passes()` takes the budget from the caller instead of baking one in.
     """
 
-    def __init__(self, samples, reference_root, plant_root):
-        #: (t, v_reference, v_register, left_error, right_error) per step.
+    def __init__(self, samples, reference_root, plant_root,
+                 reference_path=None, plant_path=None):
+        #: (t, v_commanded, v_register, left_error, right_error) per step.
         self.samples = samples
+        #: [(t, x, y, yaw, commanded_wheel_speed, actual_wheel_speed)] per step, for
+        #: each path. Kept so a figure can show the divergence developing rather than
+        #: only its endpoint -- the shape of the lag is the informative part.
+        self.reference_path = reference_path or []
+        self.plant_path = plant_path or []
         self.reference_pose = reference_root.pose
         self.plant_pose = plant_root.pose
 
@@ -555,6 +561,7 @@ def compare_drive(profile, dt=1.0 / 60.0, track=0.5, wheel_radius=0.1,
         **drive_kwargs)
 
     samples = []
+    reference_path, plant_path = [], []
     clock = 0.0
     for seconds, v, omega in profile:
         steps = max(1, int(round(seconds / dt)))
@@ -575,8 +582,13 @@ def compare_drive(profile, dt=1.0 / 60.0, track=0.5, wheel_radius=0.1,
             clock += dt
             samples.append((clock, v, 0.5 * (left_actual + right_actual),
                             left_actual - left_cmd, right_actual - right_cmd))
+            rx, ry, ryaw = reference_root.pose
+            px, py, pyaw = plant_root.pose
+            reference_path.append((clock, rx, ry, ryaw, left_cmd, left_cmd))
+            plant_path.append((clock, px, py, pyaw, left_cmd, left_actual))
 
-    return DriveReport(samples, reference_root, plant_root)
+    return DriveReport(samples, reference_root, plant_root,
+                       reference_path, plant_path)
 
 
 def compare_lidar(world, seconds=1.0, dt=1.0 / 60.0, pose=(0.0, 0.0, 0.0),
