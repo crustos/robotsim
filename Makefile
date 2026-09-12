@@ -28,6 +28,10 @@ test_rig:
 test_sensors:
 	cd tests && ./sensor_test.py
 
+## Offline gate: needs no Blender, so it is plain python3 rather than headless.py.
+test_armulator_bridge:
+	cd tests && python3 ./armulator_bridge_test.py
+
 test_lidar:
 	cd tests && ./lidar_test.py
 
@@ -105,7 +109,7 @@ corpus:
 train:
 	./tools/train_perception.py --corpus /tmp/corpus --epochs 40
 
-test_all: test test_anim test_joints test_drive test_record test_arm_record test_rig test_sensors test_lidar test_contact test_firmware test_fleet test_telemetry test_dataset test_perception test_muble test_muble_blender test_captions test_control_policy
+test_all: test test_anim test_joints test_drive test_record test_arm_record test_rig test_sensors test_lidar test_contact test_firmware test_fleet test_telemetry test_dataset test_perception test_muble test_muble_blender test_captions test_control_policy test_armulator_bridge
 
 install:
 	chmod +x robotsim.py
