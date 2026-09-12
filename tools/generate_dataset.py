@@ -39,6 +39,7 @@ lighting silently failed passes every structural check there is.
 """
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -67,6 +68,13 @@ def main(argv):
                     help='how many processes are generating in total')
     ap.add_argument('--no-verify', action='store_true',
                     help='skip verification (a shard cannot verify the whole)')
+    ap.add_argument('--muble-scenes', default=None,
+                    help='render MuBlE scenes instead of procedural ones: a '
+                         'handoff file, a directory of them, or a raw MuBlE '
+                         'scenes.json')
+    ap.add_argument('--muble-root', default=None,
+                    help='MuBlE checkout to resolve shapes and materials '
+                         'against (default: whatever the handoff recorded)')
     args = ap.parse_args(argv)
 
     resolution = (args.width, args.height)
@@ -104,6 +112,19 @@ def main(argv):
         ds.label(token, index)
     ds.label('obstacle', OBSTACLE_LABEL)
 
+    ## MuBlE scenes replace the procedural ones as the source of *geometry*.
+    ## Lighting, world and viewpoint stay randomised on top, because the whole
+    ## point of the corpus is appearance variation over fixed structure -- a
+    ## fixed scene rendered identically every time teaches Stage 1 nothing.
+    muble_scenes = load_muble(args.muble_scenes, args.muble_root) if args.muble_scenes else None
+    if muble_scenes:
+        print('using %d MuBlE scene(s) as geometry' % len(muble_scenes))
+        ## The robot is a metre-scale vehicle and these are tabletop scenes; it
+        ## would fill the frame. Hidden from render rather than deleted, because
+        ## its camera is still what captures the sample.
+        for part in bot.parts():
+            part.hide_render = True
+
     indices = [i for i in range(args.samples) if i % args.shards == args.shard]
     print('generating %d samples (shard %d/%d) -> %s'
           % (len(indices), args.shard, args.shards, args.out))
@@ -114,13 +135,25 @@ def main(argv):
 
         ## Order matters: scene() clears everything the randomizer previously
         ## made, lights included, so lights must be created after it.
-        obstacles = rnd.scene(obstacles=tuple(args.obstacles), label=OBSTACLE_LABEL)
-        rnd.materials(obstacles)
-        rnd.lighting(count=(1, 3), energy=(3.0, 14.0))
-        rnd.world()
-        rnd.pose(bot.root, area=max(1.0, args.extent * 0.3), z=0.15)
-        rnd.camera(camera, looking_at=(0, 0, 0.6),
-                   distance=(args.extent * 0.4, args.extent * 1.1))
+        if muble_scenes:
+            ## Round-robin rather than random, so a corpus of N samples over M
+            ## scenes covers every scene evenly instead of leaving some unseen.
+            scene_spec = muble_scenes[i % len(muble_scenes)]
+            obstacles = place_muble(scene_spec, ds, args.muble_root)
+            rnd.scene(obstacles=(0, 0), clear=True)
+            centre, radius = muble_bounds(scene_spec)
+            rnd.lighting(count=(1, 3), energy=(3.0, 14.0))
+            rnd.world()
+            frame_camera(camera, rnd, centre,
+                         distance=(radius * 2.5, radius * 6.0))
+        else:
+            obstacles = rnd.scene(obstacles=tuple(args.obstacles), label=OBSTACLE_LABEL)
+            rnd.materials(obstacles)
+            rnd.lighting(count=(1, 3), energy=(3.0, 14.0))
+            rnd.world()
+            rnd.pose(bot.root, area=max(1.0, args.extent * 0.3), z=0.15)
+            rnd.camera(camera, looking_at=(0, 0, 0.6),
+                       distance=(args.extent * 0.4, args.extent * 1.1))
         ## Pin the sampler to the sample's own seed, so a frame does not depend
         ## on how many frames preceded it in this process -- which is what makes
         ## the corpus independent of how it was sharded across workers.
@@ -153,8 +186,13 @@ def main(argv):
 
         ds.write(i, seed=seed,
                  meta={'obstacles': len(obstacles),
+                       'source': ('muble:%s' % muble_scenes[i % len(muble_scenes)].get('index')
+                                  if muble_scenes else 'procedural'),
                        'lens': round(camera.data.lens, 3),
-                       'camera': [round(v, 4) for v in camera.location],
+                       ## World space: camera.location is relative to CAM.HUB
+                       ## and is not where the camera actually is.
+                       'camera': [round(v, 4)
+                                  for v in camera.matrix_world.translation],
                        'rgb_engine': args.rgb_engine},
                  **files)
 
@@ -187,6 +225,126 @@ def main(argv):
 #: Obstacles are not part of the robot, so they take an index outside the robot
 #: class range rather than colliding with one of its parts.
 OBSTACLE_LABEL = 7
+
+#: Objects imported for the current sample, cleared before the next one. Module
+#: level because the sample loop is a loop rather than a class, and the previous
+#: sample's objects have to be removed by something that remembers them.
+_IMPORTED = []
+
+
+def load_muble(path, root=None):
+    """Every MuBlE scene at `path`, which may be a file or a directory."""
+    import muble_bridge
+    if os.path.isdir(path):
+        return [muble_bridge.load(os.path.join(path, name), root=root)
+                for name in sorted(os.listdir(path)) if name.endswith('.json')]
+
+    import json
+    with open(path) as handle:
+        data = json.load(handle)
+    if isinstance(data, dict) and 'scenes' in data:
+        ## A raw MuBlE bundle holds many scenes; a handoff holds one.
+        return [muble_bridge.convert(s, i, root=root)
+                for i, s in enumerate(data['scenes'])]
+    return [muble_bridge.load(path, root=root)]
+
+
+def place_muble(scene, ds, root=None):
+    """
+    Put one MuBlE scene in the world, replacing whatever the last sample left.
+
+    The label map is re-recorded on the Dataset for every sample rather than
+    once for the corpus. That is deliberate: scenes contain different objects,
+    so the meaning of index 17 genuinely differs between samples, and a single
+    corpus-level map would be quietly wrong for most of them.
+    """
+    import muble_bridge
+    for obj in _IMPORTED:
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except (ReferenceError, RuntimeError):
+            ## Already gone -- the randomizer's clear() may have taken it.
+            pass
+    _IMPORTED.clear()
+
+    ## table=False: robotsim's own GROUND already sits with its top face at
+    ## z=0, which is the plane MuBlE placed these objects on. Adding the
+    ## handoff's table too would put a second surface in the same place and
+    ## leave the two z-fighting.
+    created, labels = muble_bridge.to_blender(scene, table=False, root=root)
+    _IMPORTED.extend(created)
+    for token, index in labels.items():
+        ds.label(token, index)
+    return created
+
+
+def frame_camera(camera, rnd, target, distance, elevation=(0.35, 1.1),
+                 lens=(28.0, 55.0)):
+    """
+    Aim a camera at a point, in world space.
+
+    `Randomizer.camera` computes its arc in world coordinates and then assigns
+    them to `camera.location` and `camera.rotation_euler`, which are *parent*
+    space. robotsim's cameras hang off a CAM.HUB with its own offset and a 90
+    degree rotation, so the two differ, and the camera ends up somewhere other
+    than where the arc put it.
+
+    Over a 10 m procedural scene viewed from 4-11 m that error is small enough
+    to be invisible -- every frame still contains the scene. Over a 0.25 m
+    tabletop viewed from under a metre it is the whole frame, and the symptom is
+    a sample whose segmentation pass contains nothing but ground.
+
+    So this writes `matrix_world` instead, which Blender converts back through
+    the parent inverse. The procedural path is deliberately left as it was: its
+    framing is already baked into every corpus generated so far, and changing it
+    would silently make old and new samples incomparable.
+    """
+    import mathutils
+    target = mathutils.Vector(target)
+    azimuth = rnd.rng.uniform(0, 2 * math.pi)
+    radius = rnd.rng.uniform(*distance)
+    pitch = rnd.rng.uniform(*elevation)
+    offset = mathutils.Vector((math.cos(azimuth) * math.cos(pitch),
+                               math.sin(azimuth) * math.cos(pitch),
+                               math.sin(pitch))) * radius
+    position = target + offset
+    direction = (target - position).normalized()
+    rotation = direction.to_track_quat('-Z', 'Y').to_matrix().to_4x4()
+    rotation.translation = position
+    camera.matrix_world = rotation
+    if hasattr(camera.data, 'lens'):
+        camera.data.lens = rnd.rng.uniform(*lens)
+    ## The parent inverse is only applied on the next depsgraph evaluation, and
+    ## the render reads the evaluated transform.
+    bpy.context.view_layer.update()
+    return camera
+
+
+def muble_bounds(scene):
+    """
+    Centre and radius of a scene's objects, for framing the camera.
+
+    MuBlE tabletops are ~0.1 m across where robotsim's procedural scenes are
+    ~10 m. A camera distance tuned for one frames the other as either a dot or
+    a texture, so the distance is derived from the content rather than fixed.
+    """
+    objects = scene.get('objects') or []
+    if not objects:
+        return (0.0, 0.0, 0.1), 0.5
+
+    points = [o.get('origin', o['position']) for o in objects]
+    centre = [sum(p[axis] for p in points) / len(points) for axis in range(3)]
+    ## Lift the aim point to mid-object height: aiming at the tabletop puts
+    ## every object in the top half of the frame.
+    heights = [o['size'][2] for o in objects]
+    centre[2] += sum(heights) / len(heights) * 0.5
+
+    radius = 0.0
+    for obj, point in zip(objects, points):
+        reach = max(obj['size'][0], obj['size'][1]) * 0.5
+        span = max(abs(point[axis] - centre[axis]) for axis in range(2))
+        radius = max(radius, span + reach)
+    return tuple(centre), max(radius, 0.05)
 
 ## No __main__ guard: robotsim execs this script into its own globals, so
 ## __name__ is never '__main__' here. Blender's own argv also carries a '--'
