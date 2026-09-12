@@ -445,6 +445,81 @@ velocity lets contact say that hitting something *took your speed away*.
 is the ray-cast implementation; **an external physics engine slots in at this
 same point**, which is what the drive interface was always shaped for.
 
+## MuJoCo contact (optional)
+
+`muble.MujocoContact` is that external engine. It satisfies the same
+`ContactModel` seam, so switching backends changes nothing downstream:
+
+```python
+robot.enable_contact(backend='mujoco', mu=1.0, mass=12.0)
+```
+
+`backend='ray'` stays the default and needs nothing installed. `'mujoco'` needs
+`pip install mujoco` and gives the robot mass, momentum that survives a
+collision, and — the reason to want it — traction. Where `RayContact` reports
+slip as a number and then moves the robot the commanded distance anyway, here
+the tyres saturate and the robot simply falls short:
+
+| surface | commanded | reached after 2 s | grip used |
+|---|---|---|---|
+| tarmac (`mu=1.0`) | 1.5 m/s | 2.86 m | 0.02 |
+| ice (`mu=0.05`) | 1.5 m/s | 0.79 m | 1.00 |
+
+Peak acceleration is `mu*g` regardless of what the motors are asked for.
+
+Like `drive.py`, `muble.py` is free of `bpy`, so the physics runs — and is
+tested — without launching Blender.
+
+### One MuJoCo detail worth knowing
+
+MuJoCo combines contact friction between two geoms by taking the **maximum**,
+not the minimum. A "frictionless" wheel on a high-friction floor is therefore
+not frictionless; the floor wins, and the solver's own tangential force fights
+any explicit tyre model almost exactly. The symptom is a robot that is grounded,
+carries full load, reports saturated grip and still crawls — every individual
+reading plausible.
+
+So every geom here is built with a low `solver_mu`: the solver supplies normal
+force and essentially nothing tangential, and all traction comes from the tyre
+model in `apply_tyres`. `mu` is then genuinely the only friction in the model
+rather than one of two competing sources.
+
+## MuBlE scenes
+
+[MuBlE](https://github.com/michaal94/MuBlE) couples MuJoCo physics to Blender
+rendering for long-horizon manipulation. It makes the opposite trade to this
+project — contact fidelity and task structure, where robotsim spends its effort
+on the render modalities and on executing real firmware — so the two compose
+rather than compete.
+
+`muble_bridge.py` reads MuBlE's tabletop scenes and puts them in front of
+robotsim's four passes. Geometry is MuBlE's own: rendering appends the authored
+`.blend` for each object from MuBlE's shape library, so the RGB pass shows the
+same meshes and materials MuBlE renders; physics uses the shipped convex-hull
+decomposition, so the robot collides with a mug's handle rather than the box
+around it. Both fall back to the bounding box *per object*, so a partial
+checkout degrades instead of failing.
+
+```sh
+make muble_handoff MUBLE=../MuBlE     # export scenes from a MuBlE checkout
+make muble_corpus  MUBLE=../MuBlE     # render them into a corpus
+```
+
+Lighting, world and viewpoint stay randomised on top of MuBlE's geometry,
+because the point of the corpus is appearance variation over fixed structure.
+
+Imported objects take pass indices from 16 up, clear of `SEGMENT_CLASSES` (0–5)
+and of procedural obstacles (7). The label map is re-recorded for *every sample*
+rather than once per corpus: different scenes hold different objects, so the
+meaning of index 17 genuinely differs between samples and a single corpus-level
+map would be quietly wrong for most of them.
+
+Two placements per object are carried and they are not interchangeable.
+`origin` is MuBlE's `3d_coords`, the object's mid-bottom, and is where the real
+mesh goes. `position` is the bounding box centre, half an object higher, and
+belongs to the box fallback only. Swapping them buries every object half its own
+height in the table.
+
 ## Inertia
 
 The commanded twist is what the motors are being asked for; `drive.v` and
@@ -999,9 +1074,11 @@ Working today:
 
 Not yet built:
 
-- Dynamics: no mass, traction or forces. Momentum is an acceleration limit,
-  not an integrated one.
-- External physics engine hookup (it slots into `drive.ContactModel`)
+- Dynamics *in the default backend*: `contact.RayContact` still has no mass,
+  traction or forces, and its momentum is an acceleration limit rather than an
+  integrated one. `muble.MujocoContact` has all three — see
+  [MuJoCo contact](#mujoco-contact-optional) — but it is opt-in, and the
+  procedural corpus is still generated kinematically.
 - Proximity/contact sensors (RGB, depth, segmentation and lidar are done)
 - The armulator path: register-level driver verification, offline
 - The PyTorch training loop and Jetson deployment path

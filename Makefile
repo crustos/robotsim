@@ -49,8 +49,31 @@ test_dataset:
 test_perception:
 	cd tests && ./perception_test.py
 
+## Runs under plain python3, not Blender: the MuJoCo backend is free of bpy on
+## purpose, so its physics can be checked without launching a scene.
+test_muble:
+	cd tests && python3 ./muble_test.py
+
+## The half that does need Blender: appending MuBlE's .blend assets, applying
+## its materials and reading a render back.
+test_muble_blender:
+	blender --background --python tests/muble_blender_test.py
+
 dataset:
 	cd tools && ./generate_dataset.py -- --samples 64 --out /tmp/corpus
+
+## A corpus whose geometry is MuBlE's tabletop scenes rather than robotsim's
+## procedural obstacles. MUBLE points at a checkout; export the scenes first:
+##   $(MUBLE)/robotsim_export.py <scenes.json> -o /tmp/muble_handoff/
+MUBLE ?= ../MuBlE
+muble_corpus:
+	cd tools && ./generate_dataset.py -- --samples 64 --out /tmp/muble_corpus \
+		--muble-scenes /tmp/muble_handoff --muble-root $(abspath $(MUBLE))
+
+muble_handoff:
+	$(MUBLE)/robotsim_export.py \
+		$(MUBLE)/demo_output/scene_generaion/NS_AP_scenes.json \
+		-o /tmp/muble_handoff/
 
 corpus:
 	./tools/generate_corpus.py --samples 512 --out /tmp/corpus --prune
@@ -58,7 +81,7 @@ corpus:
 train:
 	./tools/train_perception.py --corpus /tmp/corpus --epochs 40
 
-test_all: test test_anim test_joints test_drive test_record test_arm_record test_rig test_sensors test_lidar test_contact test_firmware test_fleet test_telemetry test_dataset test_perception
+test_all: test test_anim test_joints test_drive test_record test_arm_record test_rig test_sensors test_lidar test_contact test_firmware test_fleet test_telemetry test_dataset test_perception test_muble test_muble_blender
 
 install:
 	chmod +x robotsim.py

@@ -996,9 +996,10 @@ class Robot:
             return True
         return (tick - self.last_capture_tick) >= self.camera_interval
 
-    def enable_contact(self, ground=True, collide=True, level=False, **kw):
+    def enable_contact(self, ground=True, collide=True, level=False,
+                       backend='ray', **kw):
         """
-        Give this robot's drive model a ray-cast contact model.
+        Give this robot's drive model a contact model.
 
         Without one the commanded pose is the pose: the base hovers at a fixed
         height and drives through walls. With one it rides the ground, stops at
@@ -1006,15 +1007,35 @@ class Robot:
 
         Contact points default to the wheels, which is what makes ground
         following and levelling agree with where the robot actually touches.
+
+        `backend` picks which kind of answer the world gives back:
+
+        'ray'    -- contact.RayContact, the default. Kinematic: a handful of
+                    ray casts per tick, no mass, and slip is reported rather
+                    than suffered. Fast enough to generate a corpus with.
+        'mujoco' -- muble.MujocoContact. Rigid-body dynamics: the robot has
+                    weight, momentum survives a collision, and a wheel asked
+                    for more grip than the surface has will spin instead.
+                    Needs `pip install mujoco`.
+
+        Both satisfy `drive.ContactModel`, so nothing downstream changes --
+        which is the whole point of the seam. Switch backends to find out how
+        much of a policy's behaviour was resting on contact being free.
         """
         points = kw.pop('contact_points', None)
         if points is None:
             points = [(w.x, w.y) for w in self.wheel_list] or [(0.0, 0.0)]
-        kw.setdefault('radius', max(self.size[0], self.size[1]) * 0.5)
-        kw.setdefault('ride_height', self.wheel_radius * 1.5)
-        kw.setdefault('ignore', self.parts())
-        self.contact = RayContact(ground=ground, collide=collide, level=level,
-                                  contact_points=points, **kw)
+
+        if backend == 'mujoco':
+            self.contact = self.mujoco_contact(points, ground=ground, **kw)
+        elif backend == 'ray':
+            kw.setdefault('radius', max(self.size[0], self.size[1]) * 0.5)
+            kw.setdefault('ride_height', self.wheel_radius * 1.5)
+            kw.setdefault('ignore', self.parts())
+            self.contact = RayContact(ground=ground, collide=collide,
+                                      level=level, contact_points=points, **kw)
+        else:
+            raise ValueError("backend must be 'ray' or 'mujoco', not %r" % backend)
         self.drive.contact = self.contact
         if ground:
             ## Start grounded rather than wherever the caller happened to leave
@@ -1022,6 +1043,38 @@ class Robot:
             bpy.context.view_layer.update()
             self.contact.snap(self.root)
         return self.contact
+
+    def mujoco_contact(self, points, ground=True, objects=None, **kw):
+        """
+        Build a MuJoCo world from the current scene and wrap it as a contact model.
+
+        Imported here rather than at module scope so MuJoCo stays genuinely
+        optional: a robotsim install without it behaves exactly as before and
+        only a caller that asks for the dynamic backend ever pays for it.
+
+        Static geometry comes from the scene's meshes minus this robot's own
+        parts -- without that exclusion the robot is built into the world it is
+        supposed to be driving through, and it starts the run wedged inside
+        itself.
+        """
+        try:
+            import muble
+        except ImportError as exc:
+            raise ImportError(
+                "backend='mujoco' needs MuJoCo: pip install mujoco. "
+                "The default backend='ray' has no extra dependencies.") from exc
+
+        kw.setdefault('mass', getattr(self, 'mass', 10.0))
+        kw.setdefault('size', tuple(self.size))
+        kw.setdefault('wheel_radius', self.wheel_radius)
+        ## The scene's floor is a mesh like any other and comes across with the
+        ## rest of the geometry, so no plane is added unless one is asked for.
+        ## Adding one by default would put an invisible surface at z=0 through
+        ## the middle of any scene whose ground sits lower.
+        kw.setdefault('ground_z', None)
+        bpy.context.view_layer.update()
+        return muble.MujocoContact.from_blender(
+            robot=self, objects=objects, contact_points=points, **kw)
 
     def add_lidar(self, location=None, rotation=None, parent=None, name='LIDAR',
                   self_filter=True, **kw):
