@@ -16,14 +16,74 @@ number that means something.
 """
 
 import argparse
+import json
 import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from perception import (Corpus, LineArtNet, train, evaluate, best_threshold,
-                        suggested_ink_weight)
+from perception import (Corpus, LineArtNet, MultiModalNet, train,
+                        train_multimodal, evaluate, evaluate_multimodal,
+                        best_threshold, suggested_ink_weight,
+                        suggested_pos_weight, constant_baseline)
+
+
+def train_with_captions(args, corpus, train_set, val_set, xtr, ytr, xva, yva,
+                        weight):
+    """
+    Train both heads: line art per pixel, propositions per frame.
+
+    The vocabulary is built from the *training* split alone. Building it from
+    the whole corpus would let a proposition that only ever appears in
+    validation into the target, which is a quiet form of leakage: the model
+    would be scored on a class it could not have seen.
+    """
+    if not train_set.has_facts:
+        raise SystemExit('corpus has no captions; regenerate with --tip and '
+                         'without --no-captions')
+
+    vocabulary = train_set.vocabulary(min_count=args.min_count)
+    if not vocabulary:
+        raise SystemExit('no proposition occurs often enough to learn '
+                         '(try --min-count 2, or generate more samples)')
+    ptr = train_set.propositions(vocabulary)
+    pva = val_set.propositions(vocabulary)
+
+    coverage = train_set.coverage(vocabulary)
+    print('%d propositions kept (of %d seen); base rates %.2f-%.2f'
+          % (len(vocabulary), len(train_set.vocabulary(min_count=1)),
+             min(coverage.values()), max(coverage.values())))
+    majority = constant_baseline(ptr, pva)
+    print('predicting the majority class scores caption micro F1 %.3f, '
+          'macro %.3f\n' % (majority['micro_f1'], majority['macro_f1']))
+
+    net = MultiModalNet(n_props=len(vocabulary), width=args.width,
+                        depth=args.depth, seed=args.seed)
+    if args.resume and os.path.isfile(args.out):
+        net.load(args.out)
+        print('resumed from %s' % args.out)
+
+    train_multimodal(net, xtr, ytr, ptr, epochs=args.epochs, batch=args.batch,
+                     lr=args.lr, ink_weight=weight,
+                     pos_weight=suggested_pos_weight(ptr),
+                     caption_weight=args.caption_weight, seed=args.seed,
+                     val=(xva, yva, pva))
+
+    net.save(args.out)
+    with open(os.path.splitext(args.out)[0] + '.vocab.json', 'w') as fh:
+        json.dump(vocabulary, fh, indent=1)
+    print('\nweights -> %s' % args.out)
+
+    final = evaluate_multimodal(net, xva, yva, pva)
+    print('val: line art F1 %.3f (blank %.3f)   caption micro F1 %.3f '
+          '(majority %.3f)  macro %.3f  exact-match %.3f'
+          % (final['f1'], final['baseline_f1'], final['prop_micro_f1'],
+             majority['micro_f1'], final['prop_macro_f1'],
+             final['prop_exact_match']))
+    if final['prop_micro_f1'] <= majority['micro_f1']:
+        print('WARNING: caption head did not beat the majority class.')
+    return 0
 
 
 def main():
@@ -40,6 +100,16 @@ def main():
     ap.add_argument('--limit', type=int, default=None)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--target', default='lineart')
+    ap.add_argument('--captions', action='store_true',
+                    help='train the caption head as well, on the propositions '
+                         'recorded in the corpus manifest')
+    ap.add_argument('--caption-weight', type=float, default=1.0)
+    ap.add_argument('--min-count', type=int, default=8,
+                    help='drop propositions appearing in fewer samples than '
+                         'this: a class with almost no positives cannot be '
+                         'learned and only drags the macro score down')
+    ap.add_argument('--resume', action='store_true',
+                    help='continue from --out if it exists')
     ap.add_argument('--tolerance', type=int, default=1,
                     help='matching tolerance in pixels for the tolerant score')
     args = ap.parse_args()
@@ -58,7 +128,14 @@ def main():
     print('ink is %.2f%% of pixels -> ink weight %.1f' % (ink * 100, weight))
     print('a blank page scores F1 0.000 and accuracy %.3f on this data\n' % (1 - ink))
 
+    if args.captions:
+        return train_with_captions(args, corpus, train_set, val_set,
+                                   xtr, ytr, xva, yva, weight)
+
     net = LineArtNet(width=args.width, depth=args.depth, seed=args.seed)
+    if args.resume and os.path.isfile(args.out):
+        net.load(args.out)
+        print('resumed from %s' % args.out)
     train(net, xtr, ytr, epochs=args.epochs, batch=args.batch, lr=args.lr,
           ink_weight=weight, seed=args.seed, val=(xva, yva))
 

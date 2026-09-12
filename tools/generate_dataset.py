@@ -72,6 +72,12 @@ def main(argv):
                     help='render MuBlE scenes instead of procedural ones: a '
                          'handoff file, a directory of them, or a raw MuBlE '
                          'scenes.json')
+    ap.add_argument('--tip', type=float, default=0.0, metavar='P',
+                    help='probability that each object is tipped over, so the '
+                         'corpus contains fallen objects for a caption to '
+                         'describe (default 0: every object upright)')
+    ap.add_argument('--no-captions', action='store_true',
+                    help='skip scene descriptions')
     ap.add_argument('--muble-root', default=None,
                     help='MuBlE checkout to resolve shapes and materials '
                          'against (default: whatever the handoff recorded)')
@@ -140,6 +146,8 @@ def main(argv):
             ## scenes covers every scene evenly instead of leaving some unseen.
             scene_spec = muble_scenes[i % len(muble_scenes)]
             obstacles = place_muble(scene_spec, ds, args.muble_root)
+            if args.tip > 0:
+                tip_objects(obstacles, rnd.rng, args.tip)
             rnd.scene(obstacles=(0, 0), clear=True)
             centre, radius = muble_bounds(scene_spec)
             rnd.lighting(count=(1, 3), energy=(3.0, 14.0))
@@ -184,7 +192,11 @@ def main(argv):
                 camera, os.path.join(work, '%06d.lineart.png' % i),
                 resolution=resolution)
 
-        ds.write(i, seed=seed,
+        facts = None
+        if not args.no_captions:
+            facts = describe_sample(obstacles, camera, files['segmentation'])
+
+        ds.write(i, seed=seed, facts=facts,
                  meta={'obstacles': len(obstacles),
                        'source': ('muble:%s' % muble_scenes[i % len(muble_scenes)].get('index')
                                   if muble_scenes else 'procedural'),
@@ -318,6 +330,83 @@ def frame_camera(camera, rnd, target, distance, elevation=(0.35, 1.1),
     ## the render reads the evaluated transform.
     bpy.context.view_layer.update()
     return camera
+
+
+def tip_objects(objects, rng, probability):
+    """
+    Knock some objects over, and re-seat them on the surface.
+
+    Without this the corpus has no fallen objects, and a predicate like
+    `tipped` has no positive examples. A proposition that never fires cannot be
+    learned: it contributes a constant to the loss and a zero to the score, and
+    its presence in the vocabulary makes the model look worse for a reason that
+    has nothing to do with the model. Generating the phenomenon is a
+    prerequisite for supervising a description of it, not a nicety.
+
+    The re-seat is the fiddly half. Rotating an object about a horizontal axis
+    moves its lowest point, so an object tipped in place ends up either floating
+    or halfway through the table. The world-space bounding box after rotation is
+    what says how far to drop it, and it has to be read after a depsgraph
+    update or it still describes the old orientation.
+    """
+    import mathutils
+    tipped = []
+    for obj in objects:
+        if obj.name == 'TABLE' or rng.random() >= probability:
+            continue
+        axis = 'X' if rng.random() < 0.5 else 'Y'
+        angle = math.radians(rng.uniform(70.0, 110.0)) * (1 if rng.random() < 0.5 else -1)
+        obj.rotation_mode = 'XYZ'
+        current = list(obj.rotation_euler)
+        current[0 if axis == 'X' else 1] += angle
+        obj.rotation_euler = current
+        tipped.append(obj)
+
+    if not tipped:
+        return tipped
+
+    bpy.context.view_layer.update()
+    for obj in tipped:
+        corners = [obj.matrix_world @ mathutils.Vector(c) for c in obj.bound_box]
+        lowest = min(c.z for c in corners)
+        obj.location.z -= lowest
+    bpy.context.view_layer.update()
+    return tipped
+
+
+def read_index_pass(path):
+    """The object-index pass as a 2-D array, read back after rendering."""
+    import numpy as np
+    image = bpy.data.images.load(path)
+    width, height = image.size
+    pixels = np.array(image.pixels[:], dtype=np.float32)
+    bpy.data.images.remove(image)
+    ## Blender stores bottom-up and RGBA interleaved; the index is in R.
+    return np.flipud(pixels.reshape(height, width, 4)[:, :, 0])
+
+
+def describe_sample(objects, camera, seg_path, default_label='obstacle'):
+    """
+    Build the scene description for one rendered frame.
+
+    Deliberately runs *after* the render rather than from the scene graph, so
+    that the visibility gate in `captions.describe` has real rendered pixel
+    counts to work from. Describing an object the frame does not contain teaches
+    a network to guess.
+    """
+    import captions
+    pairs = []
+    for obj in objects:
+        index = getattr(obj, 'pass_index', 0)
+        if not index:
+            continue
+        if obj.get('label') is None:
+            obj['label'] = default_label
+        pairs.append((obj, index))
+    if not pairs:
+        return None
+    records = captions.objects_from_blender(pairs, camera)
+    return captions.describe(records, read_index_pass(seg_path))
 
 
 def muble_bounds(scene):
