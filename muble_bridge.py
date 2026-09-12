@@ -333,6 +333,10 @@ def to_blender(scene, base=LABEL_BASE, table=True, collection=None,
         ## The whole reason the bridge carries integer ids: this single
         ## assignment is what makes the object identifiable in the semantic map.
         obj.pass_index = label_of(spec, base)
+        ## The category, in words. The index survives into the semantic map and
+        ## the word survives into the caption; without this the description
+        ## would have to call a mug 'mug2_00'.
+        obj['label'] = spec.get('label') or spec['name']
         created.append(obj)
 
     if collection is not None:

@@ -108,13 +108,16 @@ class Dataset:
     def path_for(self, index, pass_name, ext):
         return os.path.join(self.sample_dir, '%06d.%s%s' % (index, pass_name, ext))
 
-    def write(self, index, capture=None, seed=None, meta=None, **extra):
+    def write(self, index, capture=None, seed=None, meta=None, facts=None,
+              **extra):
         """
         Record one sample.
 
         `capture` is the dict robotsim's SensorRig returns for one camera --
         {pass: path} -- and `extra` takes any further modality by keyword, which
-        is how line art (rendered separately) joins the same sample.
+        is how line art (rendered separately) joins the same sample. `facts` is
+        the scene description: propositions and a caption, which are data rather
+        than a file and so are stored inline.
 
         Files already in place are moved into the dataset rather than copied,
         so generation does not pay twice for every frame it writes.
@@ -149,6 +152,12 @@ class Dataset:
             entry['seed'] = seed
         if meta:
             entry['meta'] = meta
+        if facts:
+            ## Propositions and a caption live in the manifest rather than in a
+            ## sidecar file: they are small, they are per-sample, and keeping
+            ## them beside `labels` means one read gives a loader everything it
+            ## needs to build a supervision target.
+            entry['facts'] = facts
 
         if self._handle is None:
             self._handle = open(self.manifest_path, 'a')

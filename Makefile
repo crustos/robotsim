@@ -54,6 +54,15 @@ test_perception:
 test_muble:
 	cd tests && python3 ./muble_test.py
 
+## Scene descriptions and the multi-task perception head. Plain python3: the
+## caption generator is bpy-free apart from one lazy helper.
+test_captions:
+	cd tests && python3 ./captions_test.py
+
+## Stage 2: the expert, the observation encoding and the control policy.
+test_control_policy:
+	cd tests && python3 ./control_test.py
+
 ## The half that does need Blender: appending MuBlE's .blend assets, applying
 ## its materials and reading a render back.
 test_muble_blender:
@@ -81,7 +90,7 @@ corpus:
 train:
 	./tools/train_perception.py --corpus /tmp/corpus --epochs 40
 
-test_all: test test_anim test_joints test_drive test_record test_arm_record test_rig test_sensors test_lidar test_contact test_firmware test_fleet test_telemetry test_dataset test_perception test_muble test_muble_blender
+test_all: test test_anim test_joints test_drive test_record test_arm_record test_rig test_sensors test_lidar test_contact test_firmware test_fleet test_telemetry test_dataset test_perception test_muble test_muble_blender test_captions test_control_policy
 
 install:
 	chmod +x robotsim.py
