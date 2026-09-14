@@ -1,50 +1,5 @@
-# robotsim — a Blender-based robot simulation platform
-
-<img src="/examples/3_arm_demo/Animation/gifmaker_me.gif"/>
-
-## What this is
-
-A simulation platform for **mobile robots with manipulators**, built on Blender.
-
-You describe a robot in Python — a wheeled base, one or more arms loaded from
-`.blend` files, a mast of cameras — and the platform gives you a fixed-timestep
-loop in which you can drive the base, command the joints, render what each camera
-sees, and bake the whole run onto the Blender timeline as an ordinary animation.
-
-The target application is **vision-driven control**. The camera renders from each
-robot are intended as the input tensor for a neural network trained in PyTorch;
-the trained network is then deployed to an onboard microcontroller (a Jetson Nano
-class device) where it drives the wheel motors directly. Blender is the world
-model, the renderer, and the ground-truth source for that training loop.
-
-## Why Blender
-
-Blender already ships the hard parts: an IK solver, an armature system with joint
-limits, a renderer, a timeline with interpolation, and a Python API over all of
-it. Rigging a new arm is a modelling task rather than a URDF-authoring task, and
-the result is immediately visualisable. The trade is that Blender is an animation
-tool, not a physics engine — so this platform is deliberately *kinematic* today,
-with the seams left in the right places to bolt on an external solver later.
-
-## Quick start
-
-```bash
-git clone https://github.com/crustos/blender_manipulator_motion_demo
-cd blender_manipulator_motion_demo
-make install        # chmod the entry points, apt-get install blender
-make test_all       # run the full test suite headless
-```
-
-Scripts are sh/Python polyglots: they exec Blender on themselves, so they run
-directly.
-
-```bash
-./robotsim.py                 # interactive, with a UI
-./headless.py my_scene.py     # background, runs your script inside Blender
-```
-
-Any `.py` passed after `--` is exec'd with the platform's globals available, so a
-script can use `Robot`, `RobotSim`, `Arm` and friends without importing anything.
+# Robotsim papers
+- https://ai.vixra.org/pdf/2609.0031v1.pdf
 
 ## A minimal simulation
 
@@ -1147,6 +1102,53 @@ everything else runs on Workbench.
 Tests assert against physical invariants rather than golden values — a closed
 circle returns to its start, scrubbing the timeline reproduces the pose the sim
 had, a commanded joint reaches the angle it was given.
+
+# robotsim — simulation platform
+
+<img src="/examples/3_arm_demo/Animation/gifmaker_me.gif"/>
+
+A simulation platform for **mobile robots with manipulators**, built on Blender.
+
+You describe a robot in Python — a wheeled base, one or more arms loaded from
+`.blend` files, a mast of cameras — and the platform gives you a fixed-timestep
+loop in which you can drive the base, command the joints, render what each camera
+sees, and bake the whole run onto the Blender timeline as an ordinary animation.
+
+The target application is **vision-driven control**. The camera renders from each
+robot are intended as the input tensor for a neural network trained in PyTorch;
+the trained network is then deployed to an onboard microcontroller (a Jetson Nano
+class device) where it drives the wheel motors directly. Blender is the world
+model, the renderer, and the ground-truth source for that training loop.
+
+## Why Blender
+
+Blender already ships the hard parts: an IK solver, an armature system with joint
+limits, a renderer, a timeline with interpolation, and a Python API over all of
+it. Rigging a new arm is a modelling task rather than a URDF-authoring task, and
+the result is immediately visualisable. The trade is that Blender is an animation
+tool, not a physics engine — so this platform is deliberately *kinematic* today,
+with the seams left in the right places to bolt on an external solver later.
+
+## Quick start
+
+```bash
+git clone https://github.com/crustos/blender_manipulator_motion_demo
+cd blender_manipulator_motion_demo
+make install        # chmod the entry points, apt-get install blender
+make test_all       # run the full test suite headless
+```
+
+Scripts are sh/Python polyglots: they exec Blender on themselves, so they run
+directly.
+
+```bash
+./robotsim.py                 # interactive, with a UI
+./headless.py my_scene.py     # background, runs your script inside Blender
+```
+
+Any `.py` passed after `--` is exec'd with the platform's globals available, so a
+script can use `Robot`, `RobotSim`, `Arm` and friends without importing anything.
+
 
 ## Status
 
