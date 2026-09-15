@@ -1,5 +1,5 @@
 # Robotsim papers
-- https://ai.vixra.org/pdf/2609.0031v1.pdf
+- https://doi.org/10.21203/rs.3.rs-11020853/v1 "From Pixels to Registers: A Multi-Modal Testing Framework for Chained Perception, Control and Firmware"
 
 ## A minimal simulation
 
